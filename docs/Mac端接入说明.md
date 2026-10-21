@@ -1,8 +1,13 @@
 # Mac 端接入说明
 
-Windows 这台电脑已经装好 Deskflow Server。Mac 只需要安装 **Deskflow Client**，不需要安装增强控制台。
+Windows 这台电脑已经装好 Deskflow Server 和增强控制台。Mac 只需要：
 
-## 1. 下载并安装
+- 安装 **Deskflow Client**，用于键鼠共享；
+- 使用 Safari 或 Chrome 打开 Windows 控制台提供的局域网地址，用于文件传输和文字剪贴板桥接。
+
+Mac 不需要安装增强控制台，也不需要额外安装文件传输程序。
+
+## 1. 下载并安装 Deskflow Client
 
 先确认 Mac 芯片：
 
@@ -68,9 +73,39 @@ computerName=MacBook
 
 当前使用手动固定模式，不会根据鼠标位置自动切换。
 
-## 5. 复制粘贴
+## 5. 文件传输
 
-Windows 端已开启 Deskflow 剪贴板同步，可以互相复制：
+确认 Mac 和 Windows 连接同一个可信局域网，并且 Windows 控制台正在运行。
+
+### 在 Mac 上打开传输页
+
+1. 在 Windows 控制台第 3 区点击 **复制 Mac 地址**；
+2. 回到 Mac，在 Safari 或 Chrome 地址栏粘贴并打开；
+3. 地址完整包含 `http://`、端口和随机令牌，不要只复制 IP。
+
+如果 Mac 当前显示的是 Windows 画面，需要先点击 **切到 Mac**，再在 Mac 上操作浏览器。
+
+### 下载 Windows 文件
+
+1. Windows 端把文件拖到控制台第 3 区，或点击 **添加文件**；
+2. Mac 浏览器刷新“从 Windows 下载”列表；
+3. 点击文件右侧的 **下载**。
+
+### 把 Mac 文件发送到 Windows
+
+1. 在 Mac 浏览器找到“发送文件到 Windows”；
+2. 把文件拖入虚线区域，或点击选择文件；
+3. 文件会保存到 Windows 的：
+
+```text
+下载\Deskflow Companion
+```
+
+4. Windows 端可在控制台点击 **打开接收文件夹**。
+
+## 6. 复制粘贴
+
+Deskflow 正常时会自动同步：
 
 - 文字；
 - HTML / 富文本；
@@ -81,22 +116,19 @@ Windows 端已开启 Deskflow 剪贴板同步，可以互相复制：
 - Windows 复制，Mac 粘贴：`Command + V`
 - Mac 复制，Windows 粘贴：`Ctrl + V`
 
-文件不能直接通过 Deskflow 剪贴板传输。
+如果自动同步没有生效，可以在 Mac 浏览器传输页使用“文字剪贴板”区域：
 
-## 6. 传输文件
+- **取 Windows 剪贴板**：读取 Windows 当前文字；
+- **复制到 Mac 剪贴板**：把文本框内容写入 Mac 剪贴板；
+- **发送到 Windows 剪贴板**：把文本框内容写入 Windows 剪贴板。
 
-两台电脑都安装并打开 LocalSend，并连接到同一局域网。
+浏览器可能因 HTTP 局域网页面限制而不能自动写入系统剪贴板。此时页面会选中文字，按 `Command + C` 即可。
 
-Windows 端：
-
-1. 打开“Deskflow 增强控制台”；
-2. 点击 **打开 LocalSend**，或把文件拖到文件区；
-3. 在 LocalSend 中选择 `MacBook`；
-4. 点击发送。
-
-Mac 端确认接收后，文件会保存到默认下载目录。
+文字桥接只处理纯文字；HTML、图片和文件不走这个文本框。
 
 ## 7. 连接不上时
+
+### Deskflow 键鼠连接不上
 
 按顺序检查：
 
@@ -104,10 +136,19 @@ Mac 端确认接收后，文件会保存到默认下载目录。
 2. 服务器地址是否为 Windows 当前的局域网 IPv4 地址，端口是否为 `24800`；
 3. 屏幕名是否为 `MacBook`；
 4. macOS 是否允许 Deskflow 的辅助功能和本地网络权限；
-5. Windows 和 Mac 是否在同一局域网；
-6. 文件传输时，LocalSend 是否已在两端打开。
+5. Windows 和 Mac 是否在同一局域网。
 
-Windows 增强控制台和本说明位于：
+### Mac 打不开文件传输页
 
-仓库中的 `dist/` 目录
+按顺序检查：
 
+1. Windows 控制台第 3 区是否显示传输服务已开启；
+2. 地址是否完整复制，尤其是末尾的随机令牌；
+3. Mac 和 Windows 是否在同一局域网；
+4. Windows 防火墙是否允许程序访问“专用网络”；
+5. Windows 当前 Wi-Fi / 网线网络是否被识别为“专用网络”；
+6. 在 Windows 高级设置中复制诊断信息，确认当前使用的局域网 IP 是否正确。
+
+请只在可信局域网中使用传输页，不要把包含随机令牌的完整地址发布到公网。
+
+Windows 增强控制台和本说明位于仓库的 `dist/` 和 `docs/` 目录。

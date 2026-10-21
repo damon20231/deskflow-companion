@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -290,6 +290,8 @@ namespace DeskflowCompanion
         public string DeskflowLog = @"C:\ProgramData\Deskflow\deskflow-daemon.log";
         public string DeskflowConfig = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"Deskflow\Deskflow.conf");
         public bool StartWithWindows;
+        public int TransferPort = 45873;
+        public string TransferToken = "";
 
         public static string ConfigDirectory
         {
@@ -332,6 +334,8 @@ namespace DeskflowCompanion
                         case "deskflowlog": cfg.DeskflowLog = value; break;
                         case "deskflowconfig": cfg.DeskflowConfig = value; break;
                         case "startwithwindows": cfg.StartWithWindows = ParseBool(value, cfg.StartWithWindows); break;
+                        case "transferport": cfg.TransferPort = ParseInt(value, cfg.TransferPort); break;
+                        case "transfertoken": cfg.TransferToken = value; break;
                     }
                 }
             }
@@ -361,9 +365,18 @@ namespace DeskflowCompanion
                 "clientName=" + ClientName,
                 "deskflowLog=" + DeskflowLog,
                 "deskflowConfig=" + DeskflowConfig,
-                "startWithWindows=" + StartWithWindows
+                "startWithWindows=" + StartWithWindows,
+                "transferPort=" + TransferPort.ToString(CultureInfo.InvariantCulture),
+                "transferToken=" + TransferToken
             };
             File.WriteAllLines(ConfigPath, lines, Encoding.UTF8);
+        }
+
+        public void EnsureTransferToken()
+        {
+            if (TransferPort < 1024 || TransferPort > 65000) TransferPort = 45873;
+            if (String.IsNullOrEmpty(TransferToken) || TransferToken.Length < 8)
+                TransferToken = Guid.NewGuid().ToString("N").Substring(0, 12);
         }
 
         private static bool NormalizeInputs(AppConfig cfg)
@@ -494,6 +507,12 @@ namespace DeskflowCompanion
         private System.Windows.Forms.Timer pendingTimer;
         private System.Windows.Forms.Timer cursorTimer;
         private System.Windows.Forms.Timer testRestoreTimer;
+        private LanTransferServer transferServer;
+        private Label transferUrlLabel;
+        private Label transferStatusLabel;
+        private Label receivedFilesLabel;
+        private readonly List<Label> transferUrlLabels = new List<Label>();
+        internal static bool PreviewMode;
 
         private string pendingTarget = "";
         private DateTime pendingSince = DateTime.MinValue;
@@ -517,7 +536,10 @@ namespace DeskflowCompanion
         {
             bool configExists = File.Exists(AppConfig.ConfigPath);
             config = AppConfig.Load();
+            config.EnsureTransferToken();
+            config.Save();
             BuildUi();
+            StartTransferServer();
             LoadMonitors();
             InitializeLogReader();
             InitializeActiveSide();
@@ -528,7 +550,7 @@ namespace DeskflowCompanion
 
         private void BuildUi()
         {
-            Text = "Deskflow 一键连接";
+            Text = "Deskflow 增强控制台";
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(980, 640);
             Size = new Size(1100, 720);
@@ -557,7 +579,7 @@ namespace DeskflowCompanion
             header.Controls.Add(headerTitle);
 
             headerSubtitle = new Label();
-            headerSubtitle.Text = "左边 Windows · 右边 Mac · 连接、切换、传文件";
+            headerSubtitle.Text = "键鼠共享 · 显示器切换 · 文件与剪贴板互传";
             headerSubtitle.ForeColor = Color.FromArgb(186, 205, 226);
             headerSubtitle.Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Regular, GraphicsUnit.Point);
             headerSubtitle.AutoSize = true;
@@ -759,53 +781,74 @@ namespace DeskflowCompanion
             monitorActions.Controls.Add(chooseMonitor, 0, 1);
             monitorActions.SetColumnSpan(chooseMonitor, 2);
 
-            var filesCard = CreateSimpleCard(cards, 2, "3  文件传输", "文件通过 LocalSend 发送，Mac 端点接收即可。", Color.FromArgb(234, 88, 12));
+            var filesCard = CreateSimpleCard(cards, 2, "3  文件与剪贴板", "拖入文件，Mac 用浏览器打开地址即可下载或上传。", Color.FromArgb(234, 88, 12));
 
             var dropZone = new Panel();
             dropZone.Location = new Point(24, 112);
-            dropZone.Size = new Size(280, 176);
+            dropZone.Size = new Size(280, 126);
             dropZone.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             dropZone.BackColor = Color.FromArgb(247, 250, 255);
             dropZone.BorderStyle = BorderStyle.FixedSingle;
             dropZone.AllowDrop = true;
             dropZone.DragEnter += FilesDragEnter;
-            dropZone.DragDrop += delegate(object sender, DragEventArgs e)
-            {
-                FilesDragDrop(sender, e);
-                if (pendingFilesList != null && pendingFilesList.Items.Count > 0) PrepareLocalSendFiles();
-            };
+            dropZone.DragDrop += FilesDragDrop;
             filesCard.Controls.Add(dropZone);
 
             var dropTitle = new Label();
-            dropTitle.Text = "把文件拖到这里";
+            dropTitle.Text = "把文件拖到这里发送";
             dropTitle.Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold, GraphicsUnit.Point);
             dropTitle.ForeColor = Color.FromArgb(56, 68, 84);
             dropTitle.TextAlign = ContentAlignment.MiddleCenter;
-            dropTitle.Location = new Point(10, 48);
-            dropTitle.Size = new Size(258, 30);
+            dropTitle.Location = new Point(10, 31);
+            dropTitle.Size = new Size(258, 28);
             dropTitle.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             dropZone.Controls.Add(dropTitle);
 
             var dropHint = new Label();
-            dropHint.Text = "也可以直接打开 LocalSend 选择文件";
+            dropHint.Text = "Mac 不需要安装额外软件";
             dropHint.ForeColor = Color.FromArgb(105, 118, 135);
             dropHint.TextAlign = ContentAlignment.MiddleCenter;
-            dropHint.Location = new Point(10, 86);
-            dropHint.Size = new Size(258, 30);
+            dropHint.Location = new Point(10, 67);
+            dropHint.Size = new Size(258, 24);
             dropHint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             dropZone.Controls.Add(dropHint);
 
-            var fileAction = new Panel();
+            transferUrlLabel = new Label();
+            transferUrlLabel.Text = "正在启动局域网传输…";
+            transferUrlLabel.ForeColor = Color.FromArgb(71, 85, 105);
+            transferUrlLabel.Location = new Point(24, 248);
+            transferUrlLabel.Size = new Size(280, 52);
+            transferUrlLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            filesCard.Controls.Add(transferUrlLabel);
+            transferUrlLabels.Add(transferUrlLabel);
+
+            var fileAction = new TableLayoutPanel();
             fileAction.Dock = DockStyle.Bottom;
             fileAction.Height = 112;
             fileAction.BackColor = Color.White;
+            fileAction.ColumnCount = 2;
+            fileAction.RowCount = 2;
+            fileAction.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            fileAction.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            fileAction.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+            fileAction.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
             filesCard.Controls.Add(fileAction);
 
-            var openLocalSend = CreateActionButton("打开 LocalSend", Color.FromArgb(234, 88, 12), Color.White, true);
-            openLocalSend.Height = 52;
-            openLocalSend.Margin = new Padding(0);
-            openLocalSend.Click += delegate { OpenLocalSend(); };
-            fileAction.Controls.Add(openLocalSend);
+            var addFiles = CreateActionButton("添加文件", Color.FromArgb(234, 88, 12), Color.White, true);
+            addFiles.Margin = new Padding(0, 0, 4, 4);
+            addFiles.Click += delegate { AddFilesFromDialog(); };
+            fileAction.Controls.Add(addFiles, 0, 0);
+
+            var copyUrl = CreateActionButton("复制 Mac 地址", Color.FromArgb(236, 242, 249), Color.FromArgb(35, 56, 82), false);
+            copyUrl.Margin = new Padding(4, 0, 0, 4);
+            copyUrl.Click += delegate { CopyTransferUrl(false); };
+            fileAction.Controls.Add(copyUrl, 1, 0);
+
+            var openBridge = CreateActionButton("打开文件与剪贴板页", Color.FromArgb(236, 242, 249), Color.FromArgb(35, 56, 82), false);
+            openBridge.Margin = new Padding(0, 4, 0, 0);
+            openBridge.Click += delegate { OpenTransferPage(""); };
+            fileAction.Controls.Add(openBridge, 0, 1);
+            fileAction.SetColumnSpan(openBridge, 2);
 
             var statusStrip = new Panel();
             statusStrip.Dock = DockStyle.Bottom;
@@ -824,7 +867,7 @@ namespace DeskflowCompanion
 
             tray = new NotifyIcon();
             tray.Icon = SystemIcons.Application;
-            tray.Text = "Deskflow 一键连接";
+            tray.Text = "Deskflow 增强控制台";
             tray.Visible = true;
             var menu = new ContextMenuStrip();
             menu.Items.Add("显示控制台", null, delegate { ShowConsole(); });
@@ -832,7 +875,7 @@ namespace DeskflowCompanion
             menu.Items.Add("切到 Mac", null, delegate { ManualSwitchToMac(); });
             menu.Items.Add("切回 Windows", null, delegate { ManualSwitchToWindows(); });
             menu.Items.Add("选择共享显示器", null, delegate { ChooseSharedMonitor(); });
-            menu.Items.Add("打开 LocalSend", null, delegate { OpenLocalSend(); });
+            menu.Items.Add("打开文件与剪贴板页", null, delegate { OpenTransferPage(""); });
             menu.Items.Add(new ToolStripSeparator());
             autoTrayItem = new ToolStripMenuItem("自动随 Deskflow 切换");
             autoTrayItem.CheckOnClick = true;
@@ -955,7 +998,7 @@ namespace DeskflowCompanion
             {
                 homePanel.BringToFront();
                 headerTitle.Text = "两台电脑，一套键鼠";
-                headerSubtitle.Text = "左边 Windows · 右边 Mac · 连接、切换、传文件";
+                headerSubtitle.Text = "键鼠共享 · 显示器切换 · 文件与剪贴板互传";
                 advancedToggleButton.Text = "高级设置";
                 RefreshStatus();
             }
@@ -1311,22 +1354,24 @@ namespace DeskflowCompanion
         private void BuildFilesPage(TabPage page)
         {
             var title = new Label();
-            title.Text = "Windows ↔ Mac 文件传输";
+            title.Text = "Windows ↔ Mac 文件与剪贴板";
             title.Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold, GraphicsUnit.Point);
             title.AutoSize = true;
             title.Location = new Point(24, 22);
             page.Controls.Add(title);
 
             var text = new Label();
-            text.Text = "把文件或文件夹拖到下面，控制台会打开 LocalSend 并复制文件路径，方便你在 LocalSend 中选择 Mac 发送。\r\n文件传输不会经过 Deskflow；文字、HTML 和图片的复制粘贴仍由 Deskflow 完成。";
+            text.Text = "把文件拖到下面，Mac 用浏览器打开控制台显示的地址，即可下载 Windows 文件或把 Mac 文件上传回来。\r\n" +
+                        "剪贴板页还提供文字手动桥接；Deskflow 的自动剪贴板同步仍然保留。";
             text.ForeColor = Color.FromArgb(56, 68, 84);
             text.Location = new Point(28, 58);
-            text.Size = new Size(800, 60);
+            text.Size = new Size(820, 58);
             page.Controls.Add(text);
 
             var dropPanel = new Panel();
-            dropPanel.Location = new Point(30, 124);
-            dropPanel.Size = new Size(800, 82);
+            dropPanel.Location = new Point(30, 120);
+            dropPanel.Size = new Size(820, 78);
+            dropPanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             dropPanel.BackColor = Color.FromArgb(247, 250, 255);
             dropPanel.BorderStyle = BorderStyle.FixedSingle;
             dropPanel.AllowDrop = true;
@@ -1335,7 +1380,7 @@ namespace DeskflowCompanion
             page.Controls.Add(dropPanel);
 
             dropFilesLabel = new Label();
-            dropFilesLabel.Text = "把文件或文件夹拖到这里\r\n也可以先打开 LocalSend，再在 LocalSend 窗口中选择文件";
+            dropFilesLabel.Text = "把文件拖到这里发送\r\n也可以点击“添加文件”";
             dropFilesLabel.ForeColor = Color.FromArgb(68, 85, 105);
             dropFilesLabel.TextAlign = ContentAlignment.MiddleCenter;
             dropFilesLabel.Dock = DockStyle.Fill;
@@ -1345,48 +1390,288 @@ namespace DeskflowCompanion
             dropPanel.Controls.Add(dropFilesLabel);
 
             pendingFilesList = new ListBox();
-            pendingFilesList.Location = new Point(30, 218);
-            pendingFilesList.Size = new Size(800, 104);
+            pendingFilesList.Location = new Point(30, 210);
+            pendingFilesList.Size = new Size(820, 142);
+            pendingFilesList.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             pendingFilesList.HorizontalScrollbar = true;
             pendingFilesList.AllowDrop = true;
             pendingFilesList.DragEnter += FilesDragEnter;
             pendingFilesList.DragDrop += FilesDragDrop;
             page.Controls.Add(pendingFilesList);
 
-            var send = new Button();
-            send.Text = "打开 LocalSend 并复制路径";
-            send.Location = new Point(30, 337);
-            send.Size = new Size(190, 38);
-            send.Click += delegate { PrepareLocalSendFiles(); };
-            page.Controls.Add(send);
+            transferUrlLabel = new Label();
+            transferUrlLabel.Text = "正在启动局域网传输…";
+            transferUrlLabel.ForeColor = Color.FromArgb(30, 64, 175);
+            transferUrlLabel.Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold, GraphicsUnit.Point);
+            transferUrlLabel.Location = new Point(30, 361);
+            transferUrlLabel.Size = new Size(820, 42);
+            transferUrlLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            page.Controls.Add(transferUrlLabel);
+            transferUrlLabels.Add(transferUrlLabel);
 
-            var copy = new Button();
-            copy.Text = "复制文件路径";
-            copy.Location = new Point(234, 337);
-            copy.Size = new Size(135, 38);
-            copy.Click += delegate { CopyQueuedPaths(); };
-            page.Controls.Add(copy);
+            var addFiles = new Button();
+            addFiles.Text = "添加文件";
+            addFiles.Location = new Point(30, 410);
+            addFiles.Size = new Size(118, 36);
+            addFiles.Click += delegate { AddFilesFromDialog(); };
+            page.Controls.Add(addFiles);
+
+            var addFolder = new Button();
+            addFolder.Text = "添加文件夹";
+            addFolder.Location = new Point(158, 410);
+            addFolder.Size = new Size(118, 36);
+            addFolder.Click += delegate { AddFolderFromDialog(); };
+            page.Controls.Add(addFolder);
+
+            var copyUrl = new Button();
+            copyUrl.Text = "复制 Mac 地址";
+            copyUrl.Location = new Point(286, 410);
+            copyUrl.Size = new Size(145, 36);
+            copyUrl.Click += delegate { CopyTransferUrl(false); };
+            page.Controls.Add(copyUrl);
+
+            var openPage = new Button();
+            openPage.Text = "打开传输页";
+            openPage.Location = new Point(441, 410);
+            openPage.Size = new Size(135, 36);
+            openPage.Click += delegate { OpenTransferPage(""); };
+            page.Controls.Add(openPage);
+
+            var incoming = new Button();
+            incoming.Text = "打开接收文件夹";
+            incoming.Location = new Point(586, 410);
+            incoming.Size = new Size(150, 36);
+            incoming.Click += delegate { OpenIncomingFolder(); };
+            page.Controls.Add(incoming);
 
             var clear = new Button();
-            clear.Text = "清空列表";
-            clear.Location = new Point(383, 337);
-            clear.Size = new Size(105, 38);
-            clear.Click += delegate { pendingFilesList.Items.Clear(); UpdateDropFilesLabel(); };
+            clear.Text = "清空共享";
+            clear.Location = new Point(746, 410);
+            clear.Size = new Size(104, 36);
+            clear.Click += delegate
+            {
+                if (transferServer != null) transferServer.ClearOutgoing();
+                if (pendingFilesList != null) pendingFilesList.Items.Clear();
+                UpdateDropFilesLabel();
+                RefreshTransferStatus();
+            };
             page.Controls.Add(clear);
 
-            var download = new Button();
-            download.Text = "打开 LocalSend 下载页";
-            download.Location = new Point(502, 337);
-            download.Size = new Size(190, 38);
-            download.Click += delegate { OpenUrl("https://localsend.org/"); };
-            page.Controls.Add(download);
+            transferStatusLabel = new Label();
+            transferStatusLabel.Text = "局域网传输正在启动…";
+            transferStatusLabel.ForeColor = Color.FromArgb(91, 104, 120);
+            transferStatusLabel.Location = new Point(30, 461);
+            transferStatusLabel.Size = new Size(820, 24);
+            transferStatusLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            page.Controls.Add(transferStatusLabel);
+
+            receivedFilesLabel = new Label();
+            receivedFilesLabel.Text = "尚未接收 Mac 文件。";
+            receivedFilesLabel.ForeColor = Color.FromArgb(91, 104, 120);
+            receivedFilesLabel.Location = new Point(30, 492);
+            receivedFilesLabel.Size = new Size(820, 48);
+            receivedFilesLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            page.Controls.Add(receivedFilesLabel);
 
             var note = new Label();
-            note.Text = "在 LocalSend 中选择 MacBook（或 Mac 上显示的设备名），点击发送后还需在 Mac 端确认接收。Deskflow 不能直接传输文件。";
-            note.ForeColor = Color.FromArgb(91, 104, 120);
-            note.Location = new Point(30, 390);
-            note.Size = new Size(800, 48);
+            note.Text = "Mac 端不需要安装额外程序：用 Safari 或 Chrome 打开复制的地址即可。请仅在可信局域网内使用。";
+            note.ForeColor = Color.FromArgb(120, 128, 140);
+            note.Location = new Point(30, 545);
+            note.Size = new Size(820, 30);
+            note.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             page.Controls.Add(note);
+        }
+
+        private void StartTransferServer()
+        {
+            try
+            {
+                if (transferServer != null) transferServer.Dispose();
+                transferServer = new LanTransferServer(
+                    config.TransferPort,
+                    config.TransferToken,
+                    Environment.MachineName,
+                    ReadWindowsClipboardText,
+                    WriteWindowsClipboardText);
+
+                transferServer.FileReceived += delegate(string path)
+                {
+                    PostToUi(delegate
+                    {
+                        statusLabel.Text = "已接收 Mac 文件：" + Path.GetFileName(path);
+                        RefreshTransferStatus();
+                    });
+                };
+                transferServer.ClipboardReceived += delegate(string text)
+                {
+                    PostToUi(delegate
+                    {
+                        statusLabel.Text = "已把 Mac 发来的文字写入 Windows 剪贴板。";
+                        RefreshTransferStatus();
+                    });
+                };
+                transferServer.TransferMessage += delegate(string message)
+                {
+                    PostToUi(delegate
+                    {
+                        statusLabel.Text = message;
+                        RefreshTransferStatus();
+                    });
+                };
+                transferServer.Start();
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "局域网传输启动失败：" + ex.Message;
+            }
+            RefreshTransferStatus();
+        }
+
+        private void RefreshTransferStatus()
+        {
+            bool running = transferServer != null && transferServer.IsRunning;
+            string url = running ? transferServer.BuildPrimaryUrl() : "";
+            if (running && PreviewMode) url = "http://192.168.1.20:45873/previewonly1/";
+
+            foreach (Label label in transferUrlLabels)
+            {
+                if (label == null || label.IsDisposed) continue;
+                label.Text = running
+                    ? "Mac 打开：" + url
+                    : "局域网传输未启动" + (transferServer != null && transferServer.LastError.Length > 0 ? "：" + transferServer.LastError : "。");
+            }
+
+            if (transferStatusLabel != null && !transferStatusLabel.IsDisposed)
+            {
+                if (running)
+                {
+                    int outgoingCount = transferServer.OutgoingCount;
+                    transferStatusLabel.Text = "● 传输服务已开启 · 端口 " + transferServer.Port + " · Windows 已共享 " + outgoingCount + " 个文件";
+                    transferStatusLabel.ForeColor = Color.FromArgb(25, 135, 84);
+                }
+                else
+                {
+                    transferStatusLabel.Text = "● 传输服务未开启，请检查端口或防火墙设置。";
+                    transferStatusLabel.ForeColor = Color.FromArgb(200, 92, 42);
+                }
+            }
+
+            if (receivedFilesLabel != null && !receivedFilesLabel.IsDisposed)
+            {
+                TransferFileInfo[] received = transferServer == null ? new TransferFileInfo[0] : transferServer.GetIncomingSnapshot();
+                if (received.Length == 0)
+                {
+                    receivedFilesLabel.Text = "尚未接收 Mac 文件。Mac 上传后会保存到“下载\\Deskflow Companion”。";
+                }
+                else
+                {
+                    string names = String.Join("、", received.Take(3).Select(x => x.Name).ToArray());
+                    receivedFilesLabel.Text = "最近接收（" + received.Length + "）：" + names + (received.Length > 3 ? " …" : "");
+                }
+            }
+        }
+
+        private void AddFilesFromDialog()
+        {
+            using (var dialog = new OpenFileDialog())
+            {
+                dialog.Title = "选择要发送到 Mac 的文件";
+                dialog.Multiselect = true;
+                dialog.CheckFileExists = true;
+                dialog.Filter = "所有文件 (*.*)|*.*";
+                if (dialog.ShowDialog(this) == DialogResult.OK) AddQueuedFiles(dialog.FileNames);
+            }
+        }
+
+        private void AddFolderFromDialog()
+        {
+            using (var dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "选择要发送到 Mac 的文件夹";
+                dialog.ShowNewFolderButton = false;
+                if (dialog.ShowDialog(this) == DialogResult.OK) AddQueuedFiles(new[] { dialog.SelectedPath });
+            }
+        }
+
+        private void CopyTransferUrl(bool openAfterCopy)
+        {
+            if (transferServer == null || !transferServer.IsRunning)
+            {
+                MessageBox.Show(this, "局域网传输服务尚未启动。请先检查 Windows 防火墙或端口占用。", "文件传输", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string url = transferServer.BuildPrimaryUrl();
+            try
+            {
+                Clipboard.SetText(url);
+                statusLabel.Text = "Mac 访问地址已复制，请在同一局域网的 Mac 浏览器中打开。";
+                if (openAfterCopy) OpenTransferPage("");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "复制地址失败：" + ex.Message + "\r\n\r\n请手动复制：" + url, "文件传输", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void OpenTransferPage(string section)
+        {
+            if (transferServer == null || !transferServer.IsRunning)
+            {
+                MessageBox.Show(this, "局域网传输服务尚未启动。", "文件传输", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string url = transferServer.BuildPrimaryUrl();
+            if (!String.IsNullOrEmpty(section)) url += "?section=" + Uri.EscapeDataString(section);
+            OpenUrl(url);
+        }
+
+        private void OpenIncomingFolder()
+        {
+            try
+            {
+                string folder = transferServer != null
+                    ? transferServer.IncomingDirectory
+                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "Deskflow Companion");
+                Directory.CreateDirectory(folder);
+                Process.Start("explorer.exe", "\"" + folder + "\"");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "打开接收文件夹失败：" + ex.Message, "文件传输", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private string ReadWindowsClipboardText()
+        {
+            if (InvokeRequired)
+            {
+                try { return (string)Invoke(new Func<string>(ReadWindowsClipboardText)); }
+                catch { return ""; }
+            }
+            try { return Clipboard.ContainsText() ? Clipboard.GetText() : ""; }
+            catch { return ""; }
+        }
+
+        private void WriteWindowsClipboardText(string text)
+        {
+            if (InvokeRequired)
+            {
+                try { Invoke(new Action<string>(WriteWindowsClipboardText), text ?? ""); }
+                catch { }
+                return;
+            }
+            try { Clipboard.SetText(text ?? ""); }
+            catch (Exception ex)
+            {
+                PostToUi(delegate { statusLabel.Text = "写入 Windows 剪贴板失败：" + ex.Message; });
+            }
+        }
+
+        private void PostToUi(Action action)
+        {
+            if (action == null || IsDisposed || Disposing || !IsHandleCreated) return;
+            try { BeginInvoke(action); }
+            catch { }
         }
 
         private void FilesDragEnter(object sender, DragEventArgs e)
@@ -1406,62 +1691,29 @@ namespace DeskflowCompanion
         {
             if (pendingFilesList == null) return;
             var existing = new HashSet<string>(pendingFilesList.Items.Cast<string>(), StringComparer.OrdinalIgnoreCase);
+            var addedPaths = new List<string>();
             foreach (string path in paths)
             {
                 if (String.IsNullOrEmpty(path)) continue;
                 if (!File.Exists(path) && !Directory.Exists(path)) continue;
-                if (existing.Add(path)) pendingFilesList.Items.Add(path);
+                if (existing.Add(path))
+                {
+                    pendingFilesList.Items.Add(path);
+                    addedPaths.Add(path);
+                }
             }
             UpdateDropFilesLabel();
-            statusLabel.Text = "已添加 " + pendingFilesList.Items.Count + " 个文件或文件夹。";
+            int shared = transferServer == null ? 0 : transferServer.SharePaths(addedPaths);
+            statusLabel.Text = "已选择 " + pendingFilesList.Items.Count + " 项，本次共享 " + shared + " 个文件。Mac 打开传输地址即可下载。";
+            RefreshTransferStatus();
         }
 
         private void UpdateDropFilesLabel()
         {
             if (dropFilesLabel == null || pendingFilesList == null) return;
             dropFilesLabel.Text = pendingFilesList.Items.Count == 0
-                ? "把文件或文件夹拖到这里\r\n也可以先打开 LocalSend，再在 LocalSend 窗口中选择文件"
-                : "已选择 " + pendingFilesList.Items.Count + " 项。点击下方按钮打开 LocalSend 并复制路径。";
-        }
-
-        private string QueuedFilesAsText()
-        {
-            if (pendingFilesList == null) return "";
-            return String.Join("\r\n", pendingFilesList.Items.Cast<string>().ToArray());
-        }
-
-        private void CopyQueuedPaths()
-        {
-            string text = QueuedFilesAsText();
-            if (text.Length == 0)
-            {
-                MessageBox.Show(this, "请先拖入文件或文件夹。", "文件传输", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            try
-            {
-                Clipboard.SetText(text);
-                statusLabel.Text = "文件路径已复制到剪贴板。";
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "复制失败：" + ex.Message, "文件传输", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private void PrepareLocalSendFiles()
-        {
-            string text = QueuedFilesAsText();
-            if (text.Length > 0)
-            {
-                try { Clipboard.SetText(text); } catch { }
-            }
-            OpenLocalSend();
-            if (text.Length > 0)
-            {
-                MessageBox.Show(this, "LocalSend 已打开，文件路径也已复制。\r\n\r\n请在 LocalSend 中选择 MacBook，再从文件列表发送。文件不会自动跨设备传输，Mac 端需要确认接收。",
-                    "发送到 Mac", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
+                ? "把文件或文件夹拖到这里\r\n添加后会立即共享给 Mac"
+                : "已选择 " + pendingFilesList.Items.Count + " 项\r\nMac 打开上方地址即可下载";
         }
 
         private void BuildClipboardPage(TabPage page)
@@ -1474,11 +1726,11 @@ namespace DeskflowCompanion
             page.Controls.Add(title);
 
             var text = new Label();
-            text.Text = "Deskflow 已负责 Windows ↔ Mac 的文字、HTML 和图片剪贴板同步。\r\n\r\n" +
+            text.Text = "Deskflow 正常时，会自动同步 Windows ↔ Mac 的文字、HTML 和图片剪贴板。\r\n\r\n" +
                         "在 Windows 复制：Ctrl+C，在 Mac 粘贴：⌘V\r\n" +
                         "在 Mac 复制：⌘C，在 Windows 粘贴：Ctrl+V\r\n\r\n" +
-                        "使用方法：先在一台电脑复制，再把鼠标移到另一台电脑，然后按粘贴快捷键。\r\n" +
-                        "文件本身不属于 Deskflow 剪贴板格式，请到“文件传输”页使用 LocalSend。";
+                        "如果自动同步没有生效，在 Mac 浏览器打开传输页，使用“文字剪贴板”区域的\r\n" +
+                        "“取 Windows 剪贴板 / 发送到 Windows 剪贴板”按钮即可手动互传文字。";
             text.ForeColor = Color.FromArgb(56, 68, 84);
             text.Location = new Point(28, 62);
             text.Size = new Size(810, 160);
@@ -1541,6 +1793,13 @@ namespace DeskflowCompanion
             refresh.Size = new Size(190, 36);
             refresh.Click += delegate { RefreshStatus(); };
             page.Controls.Add(refresh);
+
+            var openBridge = new Button();
+            openBridge.Text = "在浏览器中打开文字桥接";
+            openBridge.Location = new Point(562, 240);
+            openBridge.Size = new Size(190, 36);
+            openBridge.Click += delegate { OpenTransferPage("clipboard"); };
+            page.Controls.Add(openBridge);
         }
 
         private void BuildHelpPage(TabPage page)
@@ -1557,7 +1816,8 @@ namespace DeskflowCompanion
                         "• 切换显示器通常需要约 1–3 秒；连续快速划动不会反复发送 DDC/CI 命令。\r\n\r\n" +
                         "已知限制\r\n" +
                         "• 某些显示器在输入未选中时不响应 DDC/CI，此时只能手动切换。\r\n" +
-                        "• 文件传输由 LocalSend 完成；Deskflow 只同步文字、HTML、图片剪贴板。\r\n" +
+                        "• 文件传输由本控制台内置的局域网页面完成，Mac 不需要安装额外程序。\r\n" +
+                        "• 文字可通过内置页面手动互传；HTML 和图片仍依赖 Deskflow 自动剪贴板。\r\n" +
                         "• 本工具不修改 Deskflow 核心，升级 Deskflow 不会覆盖本工具。";
             text.ForeColor = Color.FromArgb(56, 68, 84);
             text.Location = new Point(28, 22);
@@ -2069,8 +2329,9 @@ namespace DeskflowCompanion
             deskflowStatusLabel.ForeColor = deskflowRunning && logExists ? Color.FromArgb(25, 135, 84) : Color.FromArgb(200, 92, 42);
 
             bool clipboard = IsDeskflowClipboardEnabled(config.DeskflowConfig);
-            clipboardStatusLabel.Text = clipboard ? "● 剪贴板同步已开启" : "● 剪贴板同步未确认";
-            clipboardStatusLabel.ForeColor = clipboard ? Color.FromArgb(25, 135, 84) : Color.FromArgb(200, 92, 42);
+            bool bridge = transferServer != null && transferServer.IsRunning;
+            clipboardStatusLabel.Text = clipboard ? "● 自动剪贴板同步已开启" : (bridge ? "● 手动剪贴板桥接可用" : "● 剪贴板同步未确认");
+            clipboardStatusLabel.ForeColor = clipboard || bridge ? Color.FromArgb(25, 135, 84) : Color.FromArgb(200, 92, 42);
 
             loadingUi = true;
             try
@@ -2088,8 +2349,9 @@ namespace DeskflowCompanion
                 ? (String.Equals(activeSide, "Mac", StringComparison.OrdinalIgnoreCase) ? "● 自动切换：开 · Mac" : "● 自动切换：开 · Windows")
                 : "● 手动切换模式";
             autoStatusLabel.ForeColor = config.AutoSwitch ? Color.FromArgb(25, 135, 84) : Color.FromArgb(120, 128, 140);
-            if (statusLabel.Text.Length == 0) statusLabel.Text = "使用顺序：确认键鼠连接 → 切换显示器 → 用 LocalSend 传文件。";
+            if (statusLabel.Text.Length == 0) statusLabel.Text = "使用顺序：确认键鼠连接 → 切换显示器 → 共享文件或互传文字。";
             RefreshHomeSummary();
+            RefreshTransferStatus();
         }
 
         private void CopyDiagnostics()
@@ -2109,6 +2371,10 @@ namespace DeskflowCompanion
             sb.AppendLine("Cursor: " + Cursor.Position.ToString());
             sb.AppendLine("WindowsInput: 0x" + config.WindowsInput.ToString("X2"));
             sb.AppendLine("MacInput: 0x" + config.MacInput.ToString("X2"));
+            sb.AppendLine("TransferPort: " + (transferServer == null ? config.TransferPort : transferServer.Port));
+            sb.AppendLine("TransferRunning: " + (transferServer != null && transferServer.IsRunning));
+            sb.AppendLine("TransferUrl: " + (transferServer != null && transferServer.IsRunning ? transferServer.BuildPrimaryUrl() : ""));
+            sb.AppendLine("IncomingDirectory: " + (transferServer != null ? transferServer.IncomingDirectory : ""));
             sb.AppendLine();
             foreach (var monitor in monitors)
             {
@@ -2120,22 +2386,6 @@ namespace DeskflowCompanion
             }
             try { Clipboard.SetText(sb.ToString()); statusLabel.Text = "诊断信息已复制。"; }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, "复制失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
-        }
-
-        private void OpenLocalSend()
-        {
-            string[] candidates = new[]
-            {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "LocalSend", "localsend_app.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "LocalSend", "localsend_app.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "LocalSend", "localsend_app.exe")
-            };
-            foreach (var path in candidates)
-            {
-                if (File.Exists(path)) { Process.Start(path); return; }
-            }
-            var answer = MessageBox.Show(this, "没有找到 LocalSend。是否打开下载页面？", "Deskflow 增强控制台", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (answer == DialogResult.Yes) OpenUrl("https://localsend.org/");
         }
 
         private void OpenDeskflow()
@@ -2240,6 +2490,7 @@ namespace DeskflowCompanion
             }
             else if (exiting)
             {
+                if (transferServer != null) { transferServer.Dispose(); transferServer = null; }
                 if (tray != null) { tray.Visible = false; tray.Dispose(); }
                 MonitorCatalog.DestroyAll();
             }
@@ -2260,6 +2511,7 @@ namespace DeskflowCompanion
                 if (pendingTimer != null) pendingTimer.Stop();
                 if (cursorTimer != null) cursorTimer.Stop();
                 if (testRestoreTimer != null) testRestoreTimer.Stop();
+                if (transferServer != null) { transferServer.Dispose(); transferServer = null; }
                 if (tray != null) { tray.Visible = false; tray.Dispose(); }
                 MonitorCatalog.DestroyAll();
             }
@@ -2285,6 +2537,7 @@ namespace DeskflowCompanion
                 string screenshot = args.Length > 2 ? args[2] : Path.Combine(directory, "screen.png");
                 try
                 {
+                    MainForm.PreviewMode = true;
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     using (var form = new MainForm())
@@ -2431,8 +2684,3 @@ namespace DeskflowCompanion
         }
     }
 }
-
-
-
-
-
