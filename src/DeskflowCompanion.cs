@@ -507,6 +507,7 @@ namespace DeskflowCompanion
         private System.Windows.Forms.Timer pendingTimer;
         private System.Windows.Forms.Timer cursorTimer;
         private System.Windows.Forms.Timer testRestoreTimer;
+        private System.Windows.Forms.Timer monitorRefreshTimer;
         private LanTransferServer transferServer;
         private Label transferUrlLabel;
         private Label transferStatusLabel;
@@ -527,6 +528,12 @@ namespace DeskflowCompanion
         private int testOriginalInput = -1;
         private bool exiting;
         private bool loadingUi;
+        private int monitorRefreshAttempts;
+
+        private const int WmPowerBroadcast = 0x0218;
+        private const int WmDisplayChange = 0x007E;
+        private const int PbtApmResumeAutomatic = 0x0012;
+        private const int PbtApmResumeSuspend = 0x0007;
 
         private static readonly Regex SwitchRegex = new Regex(
             "switch from \"(?<from>[^\"]+)\" to \"(?<to>[^\"]+)\" at",
@@ -923,6 +930,10 @@ namespace DeskflowCompanion
             testRestoreTimer = new System.Windows.Forms.Timer();
             testRestoreTimer.Interval = 10000;
             testRestoreTimer.Tick += delegate { RestoreTestSwitch(); };
+
+            monitorRefreshTimer = new System.Windows.Forms.Timer();
+            monitorRefreshTimer.Interval = 1200;
+            monitorRefreshTimer.Tick += delegate { RefreshMonitorAfterSystemChange(); };
 
             FormClosing += OnFormClosing;
             Resize += delegate
@@ -1854,6 +1865,146 @@ namespace DeskflowCompanion
             page.Controls.Add(autoStart);
         }
 
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WmDisplayChange)
+            {
+                ScheduleMonitorRefresh(900);
+            }
+            else if (m.Msg == WmPowerBroadcast)
+            {
+                int reason = m.WParam.ToInt32();
+                if (reason == PbtApmResumeAutomatic || reason == PbtApmResumeSuspend)
+                    ScheduleMonitorRefresh(1500);
+            }
+            base.WndProc(ref m);
+        }
+
+        private void ScheduleMonitorRefresh(int delayMs)
+        {
+            if (monitorRefreshTimer == null || exiting || IsDisposed) return;
+            monitorRefreshAttempts = 0;
+            monitorRefreshTimer.Stop();
+            monitorRefreshTimer.Interval = Math.Max(250, delayMs);
+            monitorRefreshTimer.Start();
+        }
+
+        private void RefreshMonitorAfterSystemChange()
+        {
+            if (monitorRefreshTimer != null) monitorRefreshTimer.Stop();
+            if (exiting || IsDisposed || String.IsNullOrEmpty(config.MonitorKey)) return;
+
+            // The cursor can remain at an edge while Windows wakes up. Do not let that
+            // trigger an automatic switch until it has moved away once.
+            edgeArmed = false;
+            if (TryRefreshSelectedMonitor())
+            {
+                monitorRefreshAttempts = 0;
+                if (selectedMonitor != null &&
+                    (selectedMonitor.CurrentInput == (uint)config.MacInput ||
+                     selectedMonitor.CurrentInput == (uint)config.WindowsInput))
+                {
+                    activeSide = selectedMonitor.CurrentInput == (uint)config.MacInput ? "Mac" : "Windows";
+                    if (String.Equals(activeSide, "Mac", StringComparison.OrdinalIgnoreCase))
+                        lastMacActivation = DateTime.UtcNow;
+                }
+                if (statusLabel != null)
+                    statusLabel.Text = "系统已恢复，共享显示器连接已重新识别。";
+                return;
+            }
+
+            monitorRefreshAttempts++;
+            if (monitorRefreshAttempts <= 4 && monitorRefreshTimer != null)
+            {
+                monitorRefreshTimer.Interval = 1200;
+                monitorRefreshTimer.Start();
+            }
+            else if (statusLabel != null)
+            {
+                statusLabel.Text = "系统已恢复，但暂时没有找到共享显示器。请稍后点击“重新扫描”。";
+            }
+        }
+
+        private bool TryRefreshSelectedMonitor()
+        {
+            string desiredKey = !String.IsNullOrEmpty(config.MonitorKey)
+                ? config.MonitorKey
+                : (selectedMonitor == null ? "" : selectedMonitor.Key);
+            string desiredDevice = selectedMonitor == null ? "" : selectedMonitor.DeviceName;
+
+            List<MonitorInfo> fresh;
+            try { fresh = MonitorCatalog.Enumerate(); }
+            catch { return false; }
+
+            MonitorInfo match = null;
+            if (!String.IsNullOrEmpty(desiredKey))
+                match = fresh.FirstOrDefault(x => String.Equals(x.Key, desiredKey, StringComparison.OrdinalIgnoreCase));
+            if (match == null && !String.IsNullOrEmpty(config.MonitorKey))
+                match = fresh.FirstOrDefault(x => String.Equals(x.DeviceName, config.MonitorKey, StringComparison.OrdinalIgnoreCase));
+            if (match == null && !String.IsNullOrEmpty(desiredDevice))
+                match = fresh.FirstOrDefault(x => String.Equals(x.DeviceName, desiredDevice, StringComparison.OrdinalIgnoreCase));
+            if (match == null) return false;
+
+            monitors = fresh;
+            selectedMonitor = match;
+            config.MonitorKey = match.Key;
+            edgeBounds = match.Bounds;
+
+            if (monitorCombo != null)
+            {
+                monitorCombo.Items.Clear();
+                foreach (var monitor in monitors) monitorCombo.Items.Add(monitor.DisplayLabel);
+                int selectedIndex = monitors.IndexOf(match);
+                if (selectedIndex >= 0) monitorCombo.SelectedIndex = selectedIndex;
+            }
+            if (windowsInputCombo != null && macInputCombo != null) PopulateInputCombos(match);
+            RefreshMonitorInfo();
+            return true;
+        }
+
+        private bool EnsureMonitorInput(byte input, out bool alreadyCurrent)
+        {
+            alreadyCurrent = false;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                if (!TryRefreshSelectedMonitor())
+                {
+                    if (attempt == 0) { Thread.Sleep(250); continue; }
+                    return false;
+                }
+                if (selectedMonitor.CurrentInput == input)
+                {
+                    alreadyCurrent = true;
+                    return true;
+                }
+                if (MonitorCatalog.SetInput(selectedMonitor, input)) return true;
+                if (attempt == 0) Thread.Sleep(300);
+            }
+            return false;
+        }
+
+        private bool TryReadCurrentInput(out byte value)
+        {
+            value = 0;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                if (!TryRefreshSelectedMonitor())
+                {
+                    if (attempt == 0) { Thread.Sleep(250); continue; }
+                    return false;
+                }
+                uint type, current, max;
+                if (NativeMethods.GetVCPFeatureAndVCPFeatureReply(selectedMonitor.Handle, 0x60, out type, out current, out max))
+                {
+                    value = (byte)(current & 0xFF);
+                    selectedMonitor.CurrentInput = value;
+                    return true;
+                }
+                if (attempt == 0) Thread.Sleep(300);
+            }
+            return false;
+        }
+
         private void LoadMonitors()
         {
             try
@@ -1992,11 +2143,9 @@ namespace DeskflowCompanion
 
         private void CaptureCurrentInput(bool asWindows)
         {
-            if (selectedMonitor == null) return;
-            uint type, current, max;
-            if (NativeMethods.GetVCPFeatureAndVCPFeatureReply(selectedMonitor.Handle, 0x60, out type, out current, out max))
+            byte value;
+            if (TryReadCurrentInput(out value))
             {
-                byte value = (byte)(current & 0xFF);
                 if (asWindows) SelectComboValue(windowsInputCombo, value);
                 else SelectComboValue(macInputCombo, value);
                 bool saved = SaveConfig();
@@ -2010,17 +2159,12 @@ namespace DeskflowCompanion
             }
             else
             {
-                MessageBox.Show(this, "无法读取当前输入。请确认显示器支持 DDC/CI。", "Deskflow 增强控制台", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "无法读取当前输入。请先唤醒共享显示器，并确认显示器支持 DDC/CI。", "Deskflow 增强控制台", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
         private bool ApplySwitch(string target, bool automatic, bool quiet)
         {
-            if (selectedMonitor == null)
-            {
-                if (!quiet) MessageBox.Show(this, "请先选择共享显示器。", "Deskflow 增强控制台", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return false;
-            }
             byte windowsInput = SelectedWindowsInput;
             byte macInput = SelectedMacInput;
             if (windowsInput == macInput)
@@ -2029,49 +2173,45 @@ namespace DeskflowCompanion
                 if (!quiet) MessageBox.Show(this, "Windows 输入和 Mac 输入不能相同。\r\n\r\n请分别选择 HDMI 1（Windows）和 HDMI 2（Mac）。", "输入配置错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
+
             bool toMac = String.Equals(target, "Mac", StringComparison.OrdinalIgnoreCase);
             byte input = toMac ? macInput : windowsInput;
             DateTime now = DateTime.UtcNow;
-            if (selectedMonitor.CurrentInput == input)
-            {
-                activeSide = toMac ? "Mac" : "Windows";
-                suppressAutoUntil = now.AddMilliseconds(900);
-                edgeEnteredAt = DateTime.MinValue;
-                if (toMac) { lastMacActivation = now; edgeArmed = false; }
-                RefreshMonitorInfo();
-                statusLabel.Text = String.Format("显示器已经显示 {0}（{1}）。", toMac ? "Mac" : "Windows", MonitorInfo.InputName(input));
-                return true;
-            }
-
-            bool ok = MonitorCatalog.SetInput(selectedMonitor, input);
+            bool alreadyCurrent;
+            bool ok = EnsureMonitorInput(input, out alreadyCurrent);
             lastSwitchTime = now;
+
             if (ok)
             {
                 selectedMonitor.CurrentInput = input;
                 activeSide = toMac ? "Mac" : "Windows";
                 edgeEnteredAt = DateTime.MinValue;
-                if (toMac) { lastMacActivation = now; edgeArmed = false; }
-                suppressAutoUntil = now.AddMilliseconds(1800);
+                if (toMac && !alreadyCurrent) { lastMacActivation = now; edgeArmed = false; }
+                suppressAutoUntil = now.AddMilliseconds(alreadyCurrent ? 900 : 1800);
             }
             else
             {
                 edgeArmed = false;
                 suppressAutoUntil = now.AddMilliseconds(1200);
             }
+
             RefreshMonitorInfo();
-            if (ok)
+            if (ok && alreadyCurrent)
+            {
+                statusLabel.Text = String.Format("显示器已经显示 {0}（{1}）。", toMac ? "Mac" : "Windows", MonitorInfo.InputName(input));
+            }
+            else if (ok)
             {
                 statusLabel.Text = String.Format("已切换到 {0}（{1}）。", toMac ? "Mac" : "Windows", MonitorInfo.InputName(input));
-                if (!quiet) tray.ShowBalloonTip(1500, "显示器已切换", MonitorInfo.InputName(input), ToolTipIcon.Info);
+                if (!quiet && tray != null) tray.ShowBalloonTip(1500, "显示器已切换", MonitorInfo.InputName(input), ToolTipIcon.Info);
             }
             else
             {
-                statusLabel.Text = "显示器输入切换失败。请检查 DDC/CI 是否已启用。";
-                if (!quiet) MessageBox.Show(this, "显示器没有接受切换命令。\r\n\r\n请在显示器 OSD 中启用 DDC/CI，或手动切换一次后再测试。", "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                statusLabel.Text = "显示器输入切换失败，已尝试重新连接显示器。请唤醒共享显示器后再试。";
+                if (!quiet) MessageBox.Show(this, "显示器没有接受切换命令。\r\n\r\n请先移动鼠标唤醒共享显示器，确认显示器 OSD 中的 DDC/CI 已开启，然后再试一次。", "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             return ok;
         }
-
         private void InitializeActiveSide()
         {
             if (selectedMonitor == null) return;
@@ -2146,14 +2286,13 @@ namespace DeskflowCompanion
 
         private void TestSelectedMonitor()
         {
-            if (selectedMonitor == null) return;
-            uint type, current, max;
-            if (!NativeMethods.GetVCPFeatureAndVCPFeatureReply(selectedMonitor.Handle, 0x60, out type, out current, out max))
+            byte currentValue;
+            if (!TryReadCurrentInput(out currentValue))
             {
-                MessageBox.Show(this, "无法读取当前显示器输入。", "测试失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "无法读取当前显示器输入。请先唤醒共享显示器后再试。", "测试失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            testOriginalInput = (int)(current & 0xFF);
+            testOriginalInput = (int)currentValue;
             testInProgress = true;
             ApplySwitch("Mac", false, true);
             testRestoreTimer.Stop();
@@ -2166,8 +2305,9 @@ namespace DeskflowCompanion
         private void RestoreTestSwitch()
         {
             testRestoreTimer.Stop();
-            if (!testInProgress || selectedMonitor == null || testOriginalInput < 0) return;
-            bool ok = MonitorCatalog.SetInput(selectedMonitor, (byte)testOriginalInput);
+            if (!testInProgress || testOriginalInput < 0) return;
+            bool alreadyCurrent;
+            bool ok = EnsureMonitorInput((byte)testOriginalInput, out alreadyCurrent);
             if (ok) selectedMonitor.CurrentInput = (uint)testOriginalInput;
             activeSide = ok && testOriginalInput == config.MacInput ? "Mac" : "Windows";
             edgeArmed = !ok || activeSide == "Windows";
@@ -2511,6 +2651,7 @@ namespace DeskflowCompanion
                 if (pendingTimer != null) pendingTimer.Stop();
                 if (cursorTimer != null) cursorTimer.Stop();
                 if (testRestoreTimer != null) testRestoreTimer.Stop();
+                if (monitorRefreshTimer != null) { monitorRefreshTimer.Stop(); monitorRefreshTimer.Dispose(); monitorRefreshTimer = null; }
                 if (transferServer != null) { transferServer.Dispose(); transferServer = null; }
                 if (tray != null) { tray.Visible = false; tray.Dispose(); }
                 MonitorCatalog.DestroyAll();
