@@ -2621,9 +2621,48 @@ namespace DeskflowCompanion
                 }
             }
 
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            bool createdNew;
+            using (var instanceMutex = new Mutex(true, @"Local\DeskflowCompanionEnhancedConsole", out createdNew))
+            {
+                if (!createdNew)
+                {
+                    ActivateRunningInstance();
+                    return;
+                }
+
+                try
+                {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    Application.Run(new MainForm());
+                }
+                finally
+                {
+                    instanceMutex.ReleaseMutex();
+                }
+            }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        private static void ActivateRunningInstance()
+        {
+            int currentId = Process.GetCurrentProcess().Id;
+            foreach (var process in Process.GetProcessesByName(Process.GetCurrentProcess().ProcessName))
+            {
+                try
+                {
+                    if (process.Id == currentId || process.MainWindowHandle == IntPtr.Zero) continue;
+                    ShowWindow(process.MainWindowHandle, 9);
+                    SetForegroundWindow(process.MainWindowHandle);
+                    return;
+                }
+                catch { }
+            }
         }
 
         private static Control FindControlOfType(Control parent, Type type)
